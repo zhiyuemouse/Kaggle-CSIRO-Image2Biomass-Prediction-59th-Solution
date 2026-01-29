@@ -18,6 +18,21 @@ The solution about CSIRO - Image2Biomass Prediction 59th
 2. We use **Image ID** as the group criterion to ensure that all Target rows corresponding to the same image are strictly divided into the same fold, thus eliminating the data leakage problem of "the same image being in both the training set and the validation set".
 3. Regarding **stratification** and **handling of long-tail distribution**: We used **Species** as the stratification basis and implemented a **Rare Class Aggregation** strategy for long-tail distribution. Rare species with fewer than 10 images were uniformly relabeled as **"Other"**. This solved the missing class (NaN) problem in the validation set caused by extreme class imbalance, ensuring that each fold evenly covers common species and rare samples (Hard Examples).
 4. This is the CSV file we use after the above processing: [CSIRO-my-train-csv-20251223](https://www.kaggle.com/datasets/zhiyue666/csiro-my-train-csv-20251223)
+- Below is a portion of our CV's corresponding PubLB and PriLB, showing an overall positive correlation.
+
+|PublicLB|PrivateLB|Local CV&darr;|
+|-----|-----|-----|
+|**0.71**|**0.63**|**0.8660**|
+|**0.72**|**0.63**|**0.8610**|
+|0.70|0.61|0.8511|
+|0.69|0.59|0.8436|
+|0.65|0.58|0.8423|
+|0.68|0.57|0.8338|
+|0.61|0.56|0.8189|
+|0.58|0.51|0.7758|
+|0.54|0.47|0.7312|
+|0.51|0.45|0.7153|
+|0.28|0.19|0.5809|
 
 ## Having discussed the construction of CV, let's talk about the loss function and local evaluation function we used.
 - We are using weighted MSELoss, and the following is its code implementation.
