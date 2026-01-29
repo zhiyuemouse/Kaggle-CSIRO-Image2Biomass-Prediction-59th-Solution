@@ -1,0 +1,838 @@
+import os
+import warnings # 避免一些可以忽略的报错
+warnings.filterwarnings('ignore')
+import sys
+import random
+import copy
+import math
+from tqdm.auto import tqdm
+from PIL import Image
+import time
+import gc
+from collections import defaultdict
+import shutil
+
+import pandas as pd
+import numpy as np
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+from sklearn.model_selection import StratifiedGroupKFold
+
+import timm
+import torch
+from torch import nn
+import torch.nn.functional as F
+from torch import optim
+from torch.utils.data import Dataset, DataLoader
+from torch.optim import lr_scheduler # 学习率调度器
+from torch.optim.lr_scheduler import _LRScheduler, CosineAnnealingLR
+
+from colorama import Fore, Back, Style
+b_ = Fore.BLUE
+sr_ = Style.RESET_ALL
+
+
+
+
+
+class CONFIG:
+    is_debug = False
+    seed = 308
+    n_folds = 5
+    n_workers = os.cpu_count() // 2
+
+    # train_csv = "/kaggle/input/csiro-biomass/train.csv" # 官方 csv
+    train_csv = "/data2/hjs/pythonProject/pythonProject/CSIRO/CSIRO_my_5fold_train_csv.csv" # 分过 5 折的 csv
+    train_img_path = "/data2/hjs/pythonProject/pythonProject/CSIRO/train" # (1000, 2000)
+    pretrain_ckpt_path = "/data2/hjs/pythonProject/pythonProject/CSIRO/ckpt"
+
+    train_batch_size = 1
+    valid_batch_size = 2
+    now_cv = -np.inf
+
+    epochs = 30
+    start_lr_backbone = 1e-5
+    start_lr_head = 1e-3
+    min_lr_backbone = 1e-8
+    min_lr_head = 1e-6
+    scheduler = 'CosineAnnealingWithWarmupLR'
+    n_accumulate = 1.0
+    ckpt_save_path = None
+    T_max = (357 // (n_folds * train_batch_size) + 1) * (n_folds - 1) * epochs
+
+    use_mixup = True
+    model_name = "vit_huge_plus_patch16_dinov3.lvd1689m"
+    # img_size = [448, 896]
+    if "dinov2" in model_name:
+        img_size = [518, 1036]
+    elif "eva02" in model_name:
+        img_size = [448, 896]
+    else:
+        img_size = [512, 1024]
+    # img_size = [384, 768]
+    """
+    tf_efficientnet_b0.ns_jft_in1k
+    edgenext_base.in21k_ft_in1k
+    vit_base_patch14_dinov2.lvd142m
+    convnextv2_tiny.fcmae_ft_in22k_in1k
+    vit_base_patch16_dinov3.lvd1689m
+    eva02_base_patch14_448.mim_in22k_ft_in22k_in1k
+    vit_huge_plus_patch16_dinov3.lvd1689m
+
+    convnext_large_mlp.laion2b_ft_augreg_inat21
+    resnet50.a1_in1k_ft_inat21
+    efficientnet_b5.in1k_ft_inat21
+    seresnext50_32x4d.racm_in1k_ft_inat21
+    vit_base_patch14_dinov2.lvd142m
+    vit_small_patch14_dinov2.lvd142m
+    convnextv2_base.fcmae_ft_in22k_in1k
+    """
+    is_pretrained = True
+    head_out = 5
+    DataParallel = False
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+
+
+
+
+
+
+def set_seed(seed=308):
+    random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    
+set_seed(CONFIG.seed)
+
+
+
+
+
+
+
+
+
+train_all = pd.read_csv(CONFIG.train_csv)
+id_and_fold = {}
+for i in range(len(train_all)):
+    row = train_all.iloc[i, :]
+    _id = row.sample_id.split("_")[0]
+    _fold = row.fold.item()
+    if _id not in id_and_fold.keys():
+        id_and_fold[_id] = _fold
+
+train = pd.DataFrame(list(id_and_fold.items()), columns=['sample_id', 'fold'])
+
+# 1. 获取配置对象
+cfg = timm.get_pretrained_cfg(CONFIG.model_name)
+
+# 2. 【核心修复】先转成字典 (.to_dict()) 再传入
+# 这样 resolve_data_config 就能正常使用 .get() 方法了
+cfg_dict = cfg.to_dict()
+data_config = timm.data.resolve_data_config(pretrained_cfg=cfg_dict)
+
+# 3. 提取结果
+_mean = data_config['mean']
+_std = data_config['std']
+
+print(f"模型: {CONFIG.model_name}")
+print(f"自动获取 Mean: {_mean}")
+print(f"自动获取 Std:  {_std}")
+# ------------------------------------------------------
+
+
+def transform(img):
+    composition = A.Compose([
+        A.Resize(CONFIG.img_size[0], CONFIG.img_size[0]),
+        A.Normalize(
+            mean=_mean,
+            std=_std
+        ),
+        ToTensorV2(),
+    ])
+    return composition(image=img)["image"]
+
+# def transform_train(img):
+#     if random.random() < 0.5:
+#         # =================================================
+#         # Path A: 50% 概率 - 原始 Transform (无增强)
+#         # =================================================
+#         composition = A.Compose([
+#             A.Resize(CONFIG.img_size[0], CONFIG.img_size[0]), # 这里resize到 (512, 512)
+#             A.Normalize(mean=_mean, std=_std),
+#             ToTensorV2(),
+#         ])
+#     else:
+#         composition = A.Compose([
+#             A.Resize(CONFIG.img_size[0], CONFIG.img_size[0]),
+#             # 几何增强 (适合俯拍的草地/植物)
+#             A.HorizontalFlip(p=0.5),      # 水平翻转
+#             A.VerticalFlip(p=0.5),        # 垂直翻转
+#             A.RandomRotate90(p=0.5),      # 90度旋转 (草地没有方向性，这个很好用)
+
+#             # A.CLAHE(clip_limit=4.0, tile_grid_size=(8, 8), p=0.5),
+#             # A.CoarseDropout(max_holes=8, max_height=32, max_width=32, fill_value=0, p=0.5),
+            
+#             # 像素/颜色增强 (模拟不同天气、光照、模糊)
+#             # A.OneOf([
+#             #     A.RandomBrightnessContrast(p=1.0), # 亮度对比度
+#             #     A.HueSaturationValue(p=1.0),       # 色调饱和度
+#             #     A.GaussNoise(p=1.0),               # 高斯噪点
+#             # ], p=0.5), # 这组增强有 50% 概率触发
+
+#             A.Normalize(mean=_mean, std=_std),
+#             ToTensorV2(),
+#         ])
+    
+#     return composition(image=img)["image"]
+
+def transform_train(img):
+    composition = A.Compose([
+        A.Resize(CONFIG.img_size[0], CONFIG.img_size[0]),
+        # 几何增强 (适合俯拍的草地/植物)
+        A.HorizontalFlip(p=0.5),      # 水平翻转
+        A.VerticalFlip(p=0.5),        # 垂直翻转
+        A.RandomRotate90(p=0.5),      # 90度旋转 (草地没有方向性，这个很好用)
+        # A.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05, p=0.5),
+        # A.CLAHE(clip_limit=4.0, tile_grid_size=(8, 8), p=0.5),
+        # A.CoarseDropout(max_holes=8, max_height=32, max_width=32, fill_value=0, p=0.5),
+        # A.OneOf([
+        #     A.RandomBrightnessContrast(p=1.0), # 亮度对比度
+        #     A.HueSaturationValue(p=1.0),       # 色调饱和度
+        #     A.GaussNoise(p=1.0),               # 高斯噪点
+        # ], p=0.5), # 这组增强有 50% 概率触发
+
+        A.Normalize(mean=_mean, std=_std),
+        ToTensorV2(),
+    ])
+    
+    return composition(image=img)["image"]
+
+def transform_valid(img):
+    composition = A.Compose([
+        A.Resize(CONFIG.img_size[0], CONFIG.img_size[0]), # 这里resize到 (512, 512)
+        A.Normalize(
+            mean=_mean,
+            std=_std
+        ),
+        ToTensorV2(),
+    ])
+    return composition(image=img)["image"]
+
+def mixup_data(x, y, alpha=0.4, p=0.8):
+    """
+    参数:
+    x: 输入图像 batch
+    y: 输入标签 batch
+    alpha: Beta 分布参数，控制混合比例 (通常 0.4)
+    p: 执行 Mixup 的概率 (例如 0.5)
+    """
+    
+    # 1. 概率判断：如果不满足概率，直接返回原图和原标签
+    if random.random() > p:
+        return x, y
+
+    # 2. 生成混合系数 lambda
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+
+    # 3. 生成随机索引 (用于打乱 batch)
+    batch_size = x.size()[0]
+    index = torch.randperm(batch_size).to(x.device)
+
+    # 4. 混合图片
+    mixed_x = lam * x + (1 - lam) * x[index, :]
+    
+    # 5. 混合标签 (回归任务直接对数值进行线性混合即可)
+    mixed_y = lam * y + (1 - lam) * y[index, :]
+
+    return mixed_x, mixed_y
+
+class CSIRODataset(Dataset):
+    def __init__(self, df, original_train=train_all, transform=transform):
+        super().__init__()
+        self.df = df
+        self.original_train = original_train
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx, :]
+        img_id = row.sample_id
+
+        img_path = os.path.join(CONFIG.train_img_path, img_id + ".jpg")
+
+        img = Image.open(img_path)
+        img = np.array(img)
+        if self.transform != None:
+            img_left = img[:, :1000, :]
+            img_right = img[:, 1000:, :]
+            img_left = self.transform(img_left)
+            img_right = self.transform(img_right)
+            img = torch.concat([img_left, img_right], dim=-1)
+        
+        target_id = ["__Dry_Clover_g", "__Dry_Dead_g", "__Dry_Green_g", "__Dry_Total_g", "__GDM_g"]
+        label = []
+        for _id in target_id:
+            tmp_row = self.original_train[self.original_train["sample_id"] == f"{img_id}{_id}"]["target"].item()
+            label.append(tmp_row)
+        label = torch.tensor(label, dtype=torch.float32)
+
+        return img, label
+    
+def prepare_loaders(df, fold=0):
+    df_train = df[df["fold"] != fold]
+    df_valid = df[df["fold"] == fold]
+    
+    train_datasets = CSIRODataset(df=df_train, transform=transform_train)
+    valid_datasets = CSIRODataset(df=df_valid, transform=transform_valid)
+    # train_datasets = CSIRODataset(df=df_train, transform=transform)
+    # valid_datasets = CSIRODataset(df=df_valid, transform=transform)
+    
+    train_loader = DataLoader(train_datasets, batch_size=CONFIG.train_batch_size, num_workers=CONFIG.n_workers, shuffle=True, pin_memory=True)
+    valid_loader = DataLoader(valid_datasets, batch_size=CONFIG.valid_batch_size, num_workers=CONFIG.n_workers, shuffle=False, pin_memory=True)
+    
+    
+    return train_loader, valid_loader
+
+
+# 以下代码可检查Dataset，DataLoader是否实现基本功能
+train_loader, valid_loader = prepare_loaders(train, 0)
+x_train, y_train = next(iter(train_loader))
+x_valid, y_valid = next(iter(valid_loader))
+print(f"X_train shape : {x_train.shape}") # (batch_size, channels, H, W)
+print(f"y_train shape : {y_train.shape}")
+print(f"x_valid shape : {x_valid.shape}")
+print(f"y_valid shape : {y_valid.shape}")
+
+# 删除变量，回收垃圾
+del train_loader, valid_loader, x_train, y_train, x_valid, y_valid
+gc.collect()
+
+
+
+
+
+
+
+
+
+
+def Calculate_Weighted_R2(y_true, y_pred):
+    """
+    计算 Kaggle CSIRO Image2Biomass 比赛的加权 R2 分数。
+    
+    参数:
+    y_true: 真实值，形状为 [n_samples, 5]
+    y_pred: 预测值，形状为 [n_samples, 5]
+    
+    列顺序假设:
+    0: Dry_Clover_g (w=0.1)
+    1: Dry_Dead_g   (w=0.1)
+    2: Dry_Green_g  (w=0.1)
+    3: Dry_Total_g  (w=0.5)
+    4: GDM_g        (w=0.2)
+    """
+    
+    # 1. 定义权重向量
+    weights = np.array([0.1, 0.1, 0.1, 0.5, 0.2])
+    
+    # 2. 确保输入是 numpy 数组
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+    
+    # 3. 计算全局加权均值 (Global Weighted Mean)
+    # 这里的 sum(weights) = 1.0，所以分母实际上就是 样本数 * 1.0
+    # 我们利用广播机制将权重应用到每一行
+    weighted_sum = np.sum(y_true * weights) 
+    total_weight = np.sum(weights) * y_true.shape[0] # weights总和 * 样本数
+    y_bar_w = weighted_sum / total_weight
+    
+    # 4. 计算残差平方和 (SS_res)
+    # 公式: sum( w_j * (y_j - y_hat_j)^2 )
+    ss_res = np.sum(weights * (y_true - y_pred)**2)
+    
+    # 5. 计算总离差平方和 (SS_tot)
+    # 公式: sum( w_j * (y_j - y_bar_w)^2 )
+    # 注意这里减去的是全局加权均值 y_bar_w
+    ss_tot = np.sum(weights * (y_true - y_bar_w)**2)
+    
+    # 6. 计算 R2
+    # 避免分母为0的极个别情况
+    if ss_tot == 0:
+        return 0.0
+        
+    r2 = 1 - (ss_res / ss_tot)
+    
+    return r2
+
+# --- 测试用例 ---
+# 模拟数据
+dummy_true = np.array([
+    [5, 16, 36, 54, 42],
+    [3, 8, 10, 18, 13]
+])
+# 假设预测非常接近
+dummy_pred = dummy_true + 0.5 
+
+score = Calculate_Weighted_R2(dummy_true, dummy_pred)
+print(f"验证集得分: {score:.5f}")
+
+# 使用示例
+# 模拟验证集数据
+n_valid_samples = 16
+# 随机生成验证集真实值和预测值
+y_valid_true = np.random.rand(n_valid_samples, 5)
+y_valid_pred = np.random.rand(n_valid_samples, 5)
+# 计算分数
+score = Calculate_Weighted_R2(y_valid_true, y_valid_pred).item()
+print(f"score: {score:.5f}")
+
+
+
+class CSIROModel(nn.Module):
+    def __init__(self):
+        super(CSIROModel, self).__init__()
+        self.backbone = timm.create_model(model_name=CONFIG.model_name, 
+                                          pretrained=False)
+        if CONFIG.is_pretrained:
+            self.backbone.load_state_dict(torch.load(f"{CONFIG.pretrain_ckpt_path}/{CONFIG.model_name}.pth"))
+
+        if "efficientnet" in CONFIG.model_name:
+            in_features = self.backbone.classifier.in_features
+            self.backbone.classifier = nn.Identity()
+        elif "edgenext" in CONFIG.model_name:
+            in_features = self.backbone.head.fc.in_features
+            self.backbone.head.fc = nn.Identity()
+        elif "convnext" in CONFIG.model_name:
+            if "dino" in CONFIG.model_name:
+                if "tiny" in CONFIG.model_name:
+                    in_features = 768
+                elif "base" in CONFIG.model_name:
+                    in_features = 1024
+            else:
+                in_features = self.backbone.head.fc.in_features
+                self.backbone.head.fc = nn.Identity()
+        elif "vit" in CONFIG.model_name:
+            if "dino" in CONFIG.model_name:
+                if "tiny" in CONFIG.model_name:
+                    in_features = 384
+                elif "small" in CONFIG.model_name:
+                    in_features = 384
+                elif "base" in CONFIG.model_name:
+                    in_features = 768
+                elif "large" in CONFIG.model_name:
+                    in_features = 1024
+                elif "huge" in CONFIG.model_name:
+                    in_features = 1280
+            else:
+                in_features = self.backbone.head.fc.in_features * 2
+            self.backbone.head.fc = nn.Identity()
+        elif "eva02" in CONFIG.model_name:
+            in_features = self.backbone.head.in_features * 2
+            self.backbone.head = nn.Identity()
+        else:
+            raise("Error model!")
+        
+        self.head = nn.Sequential(
+            nn.Linear(in_features * 2, in_features // 2),
+            nn.LayerNorm(in_features // 2),
+            nn.LeakyReLU(),
+            nn.Dropout(0.2), 
+            nn.Linear(in_features // 2, CONFIG.head_out),
+        )
+        self.head.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            torch.nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu', a=0.01)
+            if m.bias is not None:
+                torch.nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            torch.nn.init.constant_(m.bias, 0)
+            torch.nn.init.constant_(m.weight, 1.0)
+        elif isinstance(m, nn.Conv1d):
+            torch.nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            if m.bias is not None:
+                torch.nn.init.constant_(m.bias, 0)
+        
+    def forward(self, x):
+        if "vit" in CONFIG.model_name or "eva02" in CONFIG.model_name:
+            mid = CONFIG.img_size[0]
+            x_left = x[:, :, :, :mid]
+            x_right = x[:, :, :, mid:]
+            _tmp1 = self.backbone(x_left)
+            _tmp2 = self.backbone(x_right)
+            _tmp = torch.cat([_tmp1, _tmp2], dim=1) # shape: [B, 1536]
+        else:
+            _tmp = self.backbone(x)
+        output = self.head(_tmp)
+        return output
+    
+model = CSIROModel()
+
+
+
+
+
+
+
+
+# criterion = nn.MSELoss()
+
+# 加权MSE损失
+class WeightedMSELoss(nn.Module):
+    def __init__(self, feature_weights=None):
+        super().__init__()
+        if feature_weights is None:
+            # 权重
+            self.register_buffer('feature_weights', 
+                               torch.tensor([0.1, 0.1, 0.1, 0.5, 0.2]))
+        else:
+            self.register_buffer('feature_weights', torch.tensor(feature_weights))
+    
+    def forward(self, y_pred, y_true):
+        # 确保权重设备和类型正确
+        weights = self.feature_weights.to(device=y_pred.device, dtype=y_pred.dtype)
+        
+        # 1. 计算加权平方误差 (Batch_Size, 5)
+        loss = weights * (y_pred - y_true) ** 2
+        
+        # 2. 关键修改：
+        # 先在 dim=1 (特征维度) 求和 -> 得到每个样本的加权 Error Sum
+        # 再在 dim=0 (Batch维度) 求平均 -> 得到 Batch 的平均 Loss
+        return loss.sum(dim=1).mean()
+
+# 实例化损失函数
+criterion = WeightedMSELoss()
+
+def train_one_epoch(model, optimizer, train_loader, epoch):
+    model.train()
+    
+    y_preds = []
+    y_trues = []
+    
+    dataset_size = 0
+    running_loss = 0.0
+    bar = tqdm(enumerate(train_loader), total=len(train_loader))
+    for step, (images, labels) in bar:
+        optimizer.zero_grad()
+        
+        batch_size = images.size(0)
+        if CONFIG.DataParallel:
+            images = images.cuda().float()
+            labels = labels.cuda().float()
+        else:
+            images = images.to(CONFIG.device, dtype=torch.float)
+            labels = labels.to(CONFIG.device, dtype=torch.float)
+
+        if CONFIG.use_mixup:
+            images, labels = mixup_data(images, labels)
+            
+        outputs = model(images)
+        loss = criterion(outputs, labels) / CONFIG.n_accumulate
+        loss.backward()
+        
+        if (step + 1) % CONFIG.n_accumulate == 0:
+            optimizer.step()
+
+            # zero the parameter gradients
+            optimizer.zero_grad()
+
+        y_preds.append(outputs.detach().cpu().numpy())
+        y_trues.append(labels.detach().cpu().numpy())
+
+        train_cv = Calculate_Weighted_R2(np.concatenate(y_trues), np.concatenate(y_preds))
+
+        running_loss += (loss.item() * batch_size)
+
+        dataset_size += batch_size
+        
+        epoch_loss = running_loss / dataset_size
+        
+        bar.set_postfix(Epoch=epoch,
+                        Train_Loss=epoch_loss,
+                        Train_CV_R2=train_cv,
+                        LR_backbone=optimizer.optimizer1.param_groups[0]['lr'],
+                        LR_head=optimizer.optimizer2.param_groups[0]['lr'])
+    # Ensure that a parameter update is performed after the last accumulation cycle
+    if (step + 1) % CONFIG.n_accumulate != 0:
+        optimizer.step()
+        optimizer.zero_grad()
+        
+    return epoch_loss, train_cv
+
+
+# @torch.inference_mode()
+def valid_one_epoch(model, optimizer, valid_loader, epoch):
+    model.eval()
+    
+    y_preds = []
+    y_trues = []
+    dataset_size = 0
+    running_loss = 0.0
+    bar = tqdm(enumerate(valid_loader), total=len(valid_loader))
+    with torch.no_grad():
+        for step, (images, labels) in bar:
+            batch_size = images.size(0)
+            if CONFIG.DataParallel:
+                images = images.cuda().float()
+                labels = labels.cuda().float()
+            else:
+                images = images.to(CONFIG.device, dtype=torch.float)
+                labels = labels.to(CONFIG.device, dtype=torch.float)
+
+            outputs = model(images)
+            loss = criterion(outputs, labels) / CONFIG.n_accumulate
+
+            y_preds.append(outputs.detach().cpu().numpy())
+            y_trues.append(labels.detach().cpu().numpy())
+            valid_cv = Calculate_Weighted_R2(np.concatenate(y_trues), np.concatenate(y_preds))
+        
+            running_loss += (loss.item() * batch_size)
+
+            dataset_size += batch_size
+
+            epoch_loss = running_loss / dataset_size
+
+            bar.set_postfix(Epoch=epoch,
+                            Valid_Loss=epoch_loss,
+                            Valid_CV_R2=valid_cv,
+                            LR_backbone=optimizer.optimizer1.param_groups[0]['lr'],
+                            LR_head=optimizer.optimizer2.param_groups[0]['lr'])
+        
+
+        y_preds = np.concatenate(y_preds)
+        y_trues = np.concatenate(y_trues)
+        cv = Calculate_Weighted_R2(y_trues, y_preds) 
+    
+    return epoch_loss, cv
+
+
+def get_time_fold():
+    # Get the current time stamp
+    current_time = time.time()
+    print("Current timestamp:", current_time)
+    
+    # Convert a timestamp to a local time structure
+    local_time = time.localtime(current_time)
+    
+    # Formatting local time
+    CONFIG.formatted_time = time.strftime('%Y-%m-%d_%H:%M:%S', local_time)
+    print("now time:", CONFIG.formatted_time)
+    
+    CONFIG.ckpt_save_path = f"/data2/hjs/pythonProject/pythonProject/CSIRO/output/{CONFIG.formatted_time}_{CONFIG.model_name}_output"
+    if os.path.exists(CONFIG.ckpt_save_path) is False:
+        os.makedirs(CONFIG.ckpt_save_path)
+
+
+
+def run_training(fold, model, optimizer, train_loader, valid_loader, num_epochs=CONFIG.epochs, now_cv=CONFIG.now_cv):
+    if torch.cuda.is_available():
+        print("[INFO] Using GPU: {} x {}\n".format(torch.cuda.get_device_name(), torch.cuda.device_count()))
+    else:
+        print("CUDA NOT USE.")
+    
+    start = time.time()
+    best_model_wts = copy.deepcopy(model.state_dict())
+    best_epoch_cv = now_cv
+    best_model_path = None
+    history = defaultdict(list)
+    
+    for epoch in range(1, num_epochs + 1):
+        gc.collect()
+        train_epoch_loss, train_epoch_cv = train_one_epoch(model, optimizer, train_loader, epoch)
+        valid_epoch_loss, valid_epoch_cv = valid_one_epoch(model, optimizer, valid_loader, epoch)
+        print(f"epoch: {epoch}, LOSS = {valid_epoch_loss}, CV = {valid_epoch_cv}")
+        
+        history['Train Loss'].append(train_epoch_loss)
+        history['Valid Loss'].append(valid_epoch_loss)
+        history['Train CV'].append(train_epoch_cv)
+        history['Valid CV'].append(valid_epoch_cv)
+        history['lr_backbone'].append(optimizer.optimizer1.param_groups[0]['lr'])
+        history['lr_head'].append(optimizer.optimizer2.param_groups[0]['lr'])
+        
+        # deep copy the model
+        if valid_epoch_cv >= best_epoch_cv:
+            print(f"{b_}epoch: {epoch}, Validation CV Improved ({best_epoch_cv} ---> {valid_epoch_cv}))")
+            best_epoch_cv = valid_epoch_cv
+            best_model_wts = copy.deepcopy(model.state_dict())
+            PATH = "{}/{}_CV_{:.4f}_Loss{:.4f}_epoch{:.0f}.pth".format(CONFIG.ckpt_save_path, fold, best_epoch_cv, valid_epoch_loss, epoch)
+            # 如果之前已经保存过 best_model，先删除旧的，节省磁盘空间
+            if best_model_path is not None and os.path.exists(best_model_path):
+                os.remove(best_model_path) # 删除旧权重
+            best_model_path = PATH
+            torch.save(model.state_dict(), PATH)
+            print(f"Model Saved{sr_}")
+            
+        print()
+    
+    end = time.time()
+    time_elapsed = end - start
+    print('Training complete in {:.0f}h {:.0f}m {:.0f}s'.format(
+        time_elapsed // 3600, (time_elapsed % 3600) // 60, (time_elapsed % 3600) % 60))
+    print("Best CV: {:.4f}".format(best_epoch_cv))
+
+    # load best model weights
+    model.load_state_dict(best_model_wts)
+
+    return model, history, best_model_path
+
+
+
+
+
+
+
+
+
+class CosineAnnealingWithWarmupLR(_LRScheduler):
+    def __init__(self, optimizer, T_max, eta_min=0, warmup_epochs=10, last_epoch=-1):
+        self.T_max = T_max
+        self.eta_min = eta_min
+        self.warmup_epochs = warmup_epochs
+        self.cosine_epochs = T_max - warmup_epochs
+        super(CosineAnnealingWithWarmupLR, self).__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        if self.last_epoch < self.warmup_epochs:
+            # Linear warmup
+            return [(base_lr * (self.last_epoch + 1) / self.warmup_epochs) for base_lr in self.base_lrs]
+        else:
+            # Cosine annealing
+            cosine_epoch = self.last_epoch - self.warmup_epochs
+            return [self.eta_min + (base_lr - self.eta_min) * (1 + math.cos(math.pi * cosine_epoch / self.cosine_epochs)) / 2 for base_lr in self.base_lrs]
+        
+
+
+
+
+
+
+# lr scheduler
+def fetch_scheduler(optimizer, T_max, min_lr):
+    if CONFIG.scheduler == 'CosineAnnealingLR':
+        scheduler = lr_scheduler.CosineAnnealingLR(optimizer,T_max=T_max, 
+                                                   eta_min=min_lr)
+    elif CONFIG.scheduler == "CosineAnnealingWithWarmupLR":
+        scheduler = CosineAnnealingWithWarmupLR(optimizer, T_max=T_max, eta_min=min_lr, warmup_epochs=T_max//CONFIG.epochs)
+        
+    elif CONFIG.scheduler == None:
+        return None
+        
+    return scheduler
+
+
+class merge_optim():
+    def __init__(self, optimizer1, optimizer2, lr_scheduler1=None, lr_scheduler2=None):
+        self.optimizer1 = optimizer1
+        self.optimizer2 = optimizer2
+        self.lr_scheduler1 = lr_scheduler1
+        self.lr_scheduler2 = lr_scheduler2
+
+    def zero_grad(self):
+        self.optimizer1.zero_grad()
+        self.optimizer2.zero_grad()
+
+    def step(self):
+        self.optimizer1.step()
+        self.optimizer2.step()
+        if self.lr_scheduler1 is not None:
+            self.lr_scheduler1.step()
+        if self.lr_scheduler2 is not None:
+            self.lr_scheduler2.step()
+
+
+def get_optimizer(model):
+    if CONFIG.DataParallel:
+        optimizer_backbone = optim.AdamW(model.module.backbone.parameters(), lr=CONFIG.start_lr_backbone)
+        optimizer_head = optim.AdamW(model.module.head.parameters(), lr=CONFIG.start_lr_head)
+    else:
+        optimizer_backbone = optim.AdamW(model.backbone.parameters(), lr=CONFIG.start_lr_backbone)
+        optimizer_head = optim.AdamW(model.head.parameters(), lr=CONFIG.start_lr_head)
+    
+    scheduler_backbone = fetch_scheduler(optimizer_backbone, T_max=CONFIG.T_max, min_lr=CONFIG.min_lr_backbone)
+    scheduler_head = fetch_scheduler(optimizer_head, T_max=CONFIG.T_max, min_lr=CONFIG.min_lr_head)
+    
+    optimizer = merge_optim(optimizer_backbone, optimizer_head, scheduler_backbone, scheduler_head)
+    return optimizer
+
+
+get_time_fold()
+
+# 1. 获取当前脚本的绝对路径
+current_script_path = os.path.abspath(__file__)
+
+# 2. 定义保存的目标 txt 文件名
+output_txt_path = f'{CONFIG.ckpt_save_path}/current_code_backup.txt'
+
+# 3. 复制文件
+shutil.copy(current_script_path, output_txt_path)
+
+print(f"已成功将 {current_script_path} 备份到 {output_txt_path}")
+
+
+oof = []
+true = []
+historys = []
+
+for fold in range(0, CONFIG.n_folds):
+    print(f"==================== Train on Fold {fold+1} ====================")
+    del model
+    torch.cuda.empty_cache()
+    model = CSIROModel()
+    if CONFIG.DataParallel:
+        device_ids = [0, 1]
+        model = torch.nn.DataParallel(model, device_ids=device_ids)
+        model = model.cuda()
+    else:
+        model = model.to(CONFIG.device)
+        
+    optimizer = get_optimizer(model)
+    
+    train_loader, valid_loader = prepare_loaders(train, fold)
+    model, history, best_model_path = run_training(fold+1, model, optimizer, 
+                                                   train_loader, valid_loader, 
+                                                   num_epochs=CONFIG.epochs, now_cv=CONFIG.now_cv)
+    historys.append(history)
+    
+    bar = tqdm(enumerate(valid_loader), total=len(valid_loader))
+    with torch.no_grad():
+        for step, (images, labels) in bar:
+            batch_size = images.size(0)
+            if CONFIG.DataParallel:
+                images = images.cuda().float()
+                labels = labels.cuda().float()
+            else:
+                images = images.to(CONFIG.device, dtype=torch.float)
+                labels = labels.to(CONFIG.device, dtype=torch.float)
+
+            outputs = model(images)
+            
+            oof.append(outputs.detach().cpu().numpy())
+            true.append(labels.detach().cpu().numpy())
+        print()
+
+oof = np.concatenate(oof)
+true = np.concatenate(true)
+
+# 第一轮 cv
+# 0.5251 # MSELoss       + 没有正则化 + efficientnetb0
+# 0.5227 # MSELoss       + 正则化    + efficientnetb0
+# 0.5472 # WeightMSELoss + 正则化    + efficientnetb0
+# 0.8073 # WeightMSELoss + 正则化    + edgenext
+# 0.8073
+
+local_cv = Calculate_Weighted_R2(true, oof)
+print("Local CV : ", local_cv)
+
+np.save("/data2/hjs/pythonProject/pythonProject/CSIRO/true.npy", true)
+np.save(f"{CONFIG.ckpt_save_path}/oof.npy", oof)
