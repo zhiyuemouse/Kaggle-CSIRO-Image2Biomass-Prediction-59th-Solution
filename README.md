@@ -1,11 +1,11 @@
-# Kaggle-CSIRO-Image2Biomass-Prediction-59th-Solution
-The solution about CSIRO - Image2Biomass Prediction 59th
+# Kaggle-CSIRO-Image2Biomass-Prediction-55th-Solution
+The solution about CSIRO - Image2Biomass Prediction 55th
 
 **The link to the competition on the Kaggle platform: [CSIRO - Image2Biomass Prediction](https://www.kaggle.com/competitions/csiro-biomass)**
 
 **This directory contains code for training 2-patch models and code for training 8-patch models. It also includes code for local CV inference verification and result analysis.**
 
-**The following section is the same as the solution I published on Kaggle, which you can read here or on Kaggle: [CSIRO 59th Solution](https://www.kaggle.com/competitions/csiro-biomass/writeups/csiro-59th-solution)**
+**The following section is the same as the solution I published on Kaggle, which you can read here or on Kaggle: [CSIRO 55th Solution](https://www.kaggle.com/competitions/csiro-biomass/writeups/csiro-55th-solution)**
 
 **These are the links to the two notebooks we submitted:**
 
